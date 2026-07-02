@@ -1,0 +1,4 @@
+interface:
+  display_name: "Open Source PR Readiness"
+  short_description: "Audit OSS PRs before maintainer review"
+  default_prompt: "Use $open-source-pr-readiness to verify this branch is ready for an upstream pull request."

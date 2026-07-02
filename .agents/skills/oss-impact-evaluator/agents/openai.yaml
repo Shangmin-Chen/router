@@ -1,0 +1,4 @@
+interface:
+  display_name: "OSS Impact Evaluator"
+  short_description: "Score whether OSS work is worth doing"
+  default_prompt: "Use $oss-impact-evaluator to decide whether this open source contribution is worth pursuing."

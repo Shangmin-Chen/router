@@ -1,0 +1,4 @@
+interface:
+  display_name: "Technical Debt Impact Hunter"
+  short_description: "Find substantial debt worth fixing"
+  default_prompt: "Use $technical-debt-impact-hunter to find substantial technical debt worth turning into a PR."
