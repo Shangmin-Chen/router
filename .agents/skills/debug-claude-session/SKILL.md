@@ -1,6 +1,6 @@
 ---
 name: debug-Codex-session
-description: Investigate a specific Codex session by session ID — correlate the local transcript (`~/.Codex/projects/...jsonl`) with the router's production logs to understand what the client rendered vs. what the upstream served. Use when given a session ID and asked "why did X render?" for a Codex conversation routed through the router.
+description: Investigate a specific Codex session by session ID — correlate the local transcript (`~/.codex/sessions/...jsonl`) with the router's production logs to understand what the client rendered vs. what the upstream served. Use when given a session ID and asked "why did X render?" for a Codex conversation routed through the router.
 ---
 
 # Debugging a Codex session
@@ -12,7 +12,7 @@ Given a Codex **session ID**, pull the local transcript (what the client saw) an
 Before starting, create a gitignored config file with your deployment's cloud logging details:
 
 ```bash
-cat > .Codex/skills/debug-Codex-session/.deployment.json <<'EOF'
+cat > .agents/skills/debug-claude-session/.deployment.json <<'EOF'
 {
   "cloud_provider": "gcp",
   "project_id": "your-project-id",
@@ -21,7 +21,7 @@ cat > .Codex/skills/debug-Codex-session/.deployment.json <<'EOF'
   "log_command_template": "gcloud logging read ... --project {project_id} --format=json"
 }
 EOF
-git add .Codex/skills/debug-Codex-session/.deployment.json.example
+git add .agents/skills/debug-claude-session/.deployment.json.example
 # .deployment.json itself should be gitignored
 ```
 
@@ -50,10 +50,10 @@ If `.deployment.json` is missing, the agent will prompt you for these details an
 ### 1. Locate the local transcript
 
 ```bash
-find ~/.Codex/projects -name '<SESSION_ID>*' -type f
+find ~/.codex/sessions ~/.codex/archived_sessions -name '*<SESSION_ID>*' -type f
 ```
 
-You get `<path>/<SESSION_ID>.jsonl` (the transcript, one JSON object per line) and a sibling `<SESSION_ID>/` directory (tool-output spillover). The `.jsonl` file is the ground truth. `wc -l` it — typical sessions are tens to hundreds of lines.
+You get a matching `.jsonl` transcript (one JSON object per line). If a sibling directory exists, it may hold tool-output spillover. The `.jsonl` file is the ground truth. `wc -l` it — typical sessions are tens to hundreds of lines.
 
 ### 2. Extract the assistant blocks showing the symptom
 
