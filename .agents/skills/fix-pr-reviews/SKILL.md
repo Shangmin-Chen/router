@@ -121,7 +121,7 @@ gh pr checks "$PR_NUMBER" --json name,state,bucket,link
 
 **Note:** For production implementations, iterate through all pages:
 - Continue fetching `reviewThreads` with `after: endCursor` until `pageInfo.hasNextPage` is false
-- Continue fetching `reviewRequests` with `after: endCursor` until `pageInfo.hasNextPage` is false  
+- Continue fetching `reviewRequests` with `after: endCursor` until `pageInfo.hasNextPage` is false
 - Continue fetching `latestReviews` with `after: endCursor` until `pageInfo.hasNextPage` is false
 
 For production implementations, iterate through all pages before computing DONE flags. For brevity in this skill spec, we show only the first page fetch.
