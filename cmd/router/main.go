@@ -36,6 +36,7 @@ import (
 	"workweave/router/internal/proxy/usage"
 	routerpubsub "workweave/router/internal/pubsub"
 	"workweave/router/internal/router"
+	"workweave/router/internal/router/bandit"
 	"workweave/router/internal/router/banditexplore"
 	"workweave/router/internal/router/cache"
 	"workweave/router/internal/router/catalog"
@@ -307,6 +308,31 @@ func main() {
 	}
 
 	{
+		// Together AI OpenAI-compatible surface. Serves the OSS pool at the top
+		// of the artificialanalysis.ai throughput tables for several models we
+		// route (DeepSeek V4 Pro, GLM-5.1, MiniMax M2.7); primary binding for
+		// those, with the prior providers kept as ordered fallbacks. Together
+		// uses "Org/Model" model IDs while the router exposes slash-form slugs,
+		// so modelIDMap is derived from the catalog's per-binding UpstreamID at
+		// boot.
+		togetherBaseURL := config.GetOr("TOGETHER_BASE_URL", openaiCompatProvider.TogetherBaseURL)
+		togetherKey := ""
+		if !byokOnly {
+			togetherKey = config.GetOr("TOGETHER_API_KEY", "")
+		}
+		providerMap[providers.ProviderTogether] = openaiCompatProvider.NewClientWithModelIDMap(togetherKey, togetherBaseURL, upstreamIDsForProvider(providers.ProviderTogether))
+		switch {
+		case byokOnly:
+			logger.Info("Together provider enabled (BYOK only)", "base_url", togetherBaseURL)
+		case togetherKey != "":
+			envKeyedProviders[providers.ProviderTogether] = struct{}{}
+			logger.Info("Together provider enabled", "base_url", togetherBaseURL)
+		default:
+			logger.Info("Together provider registered (BYOK only — set TOGETHER_API_KEY for deployment-level use)", "base_url", togetherBaseURL)
+		}
+	}
+
+	{
 		// Bedrock via the OpenAI-compatible "bedrock-mantle" surface
 		// (https://bedrock-mantle.{region}.api.aws/v1). AWS recommends this
 		// over the model-native bedrock-runtime/InvokeModel surface; both
@@ -358,6 +384,20 @@ func main() {
 	availableProviders := make(map[string]struct{}, len(providerMap))
 	for name := range providerMap {
 		availableProviders[name] = struct{}{}
+	}
+
+	// Fail loud if any registered provider lacks a ProviderFamilies entry: an
+	// inbound request routed to it would fall through every cross-format dispatch
+	// switch to ErrProviderNotConfigured (a silent 502) even though the provider
+	// looked "enabled" at boot. Panic here so the misconfiguration aborts the
+	// process rather than surfacing in production traffic.
+	registeredProviders := make([]string, 0, len(providerMap))
+	for name := range providerMap {
+		registeredProviders = append(registeredProviders, name)
+	}
+	if err := providers.ValidateDispatchable(registeredProviders); err != nil {
+		logger.Error("Registered provider missing a translation family; refusing to boot", "err", err)
+		panic(err)
 	}
 
 	rtr, err := buildClusterScorer(availableProviders)
@@ -479,28 +519,44 @@ func main() {
 	}
 	logger.Info("Hard-pin model resolved", "provider", hardPinProvider, "model", hardPinModel, "byok_only", byokOnly)
 
-	// Per-request hard-pin resolver for byokOnly deployments. Loads the
-	// default cluster bundle once and closes over its metadata/registry; the
-	// resolver is then called from the proxy with the request's enabled-
-	// providers set so compaction lands on the cheapest model the request
-	// can actually authenticate to. Selfhosted mode leaves the resolver nil
-	// — its boot-time hardPin{Provider,Model} is already correct.
-	var hardPinResolver func(map[string]struct{}) (string, string, bool)
-	if byokOnly {
+	// Per-request hard-pin resolver. Loads the default cluster bundle once and
+	// closes over its metadata/registry; the resolver is then called from the
+	// proxy with the request's enabled-providers set and the installation's
+	// excluded_models deny set. It serves two purposes:
+	//   - byokOnly: the boot-time pin was computed over every registered
+	//     provider, but the request may only BYOK a subset; resolving per
+	//     request keeps the hard-pin on a provider the request can
+	//     authenticate to.
+	//   - all modes: the hard-pin tier bypasses the scorer, which is the only
+	//     component that applies excluded_models. Passing the deny set here
+	//     skips an excluded model on the title-gen/classifier/probe path, just
+	//     as the scorer does on the main-loop path.
+	// If the bundle fails to load the resolver stays nil and the proxy falls
+	// back to the boot-time hardPin{Provider,Model}.
+	//
+	// An explicit ROUTER_HARD_PIN_MODEL operator override is absolute by design
+	// (it also bypasses the tier ceiling downstream); we do NOT wire the
+	// resolver in that case so the operator's chosen model is never silently
+	// rewritten. excluded_models then can't redirect it, but an operator pin is
+	// a deliberate opt-in — the proxy logs if it collides with the exclude list.
+	var hardPinResolver func(enabled, denySet map[string]struct{}) (string, string, bool)
+	if config.GetOr("ROUTER_HARD_PIN_MODEL", "") == "" {
 		reqVersion := config.GetOr("ROUTER_CLUSTER_VERSION", cluster.LatestVersion)
 		if version, vErr := cluster.ResolveVersion(reqVersion); vErr == nil {
 			if bundle, bErr := cluster.LoadBundle(version); bErr == nil {
 				meta, registry := bundle.Metadata, bundle.Registry
-				hardPinResolver = func(enabled map[string]struct{}) (string, string, bool) {
-					return cluster.FastestModel(meta, registry, enabled)
+				hardPinResolver = func(enabled, denySet map[string]struct{}) (string, string, bool) {
+					return cluster.FastestModelInSet(meta, registry, enabled, denySet, nil)
 				}
-				logger.Info("Hard-pin resolver wired for byokOnly mode (per-request fastest model from cluster bundle)", "version", version)
+				logger.Info("Hard-pin resolver wired (per-request fastest model from cluster bundle, applies excluded_models)", "version", version, "byok_only", byokOnly)
 			} else {
-				logger.Warn("Hard-pin resolver disabled: cluster bundle failed to load; byokOnly hard-pin will fall back to boot-time defaults", "err", bErr, "version", version)
+				logger.Warn("Hard-pin resolver disabled: cluster bundle failed to load; hard-pin will fall back to boot-time defaults and cannot apply excluded_models", "err", bErr, "version", version)
 			}
 		} else {
-			logger.Warn("Hard-pin resolver disabled: could not resolve cluster version; byokOnly hard-pin will fall back to boot-time defaults", "err", vErr)
+			logger.Warn("Hard-pin resolver disabled: could not resolve cluster version; hard-pin will fall back to boot-time defaults and cannot apply excluded_models", "err", vErr)
 		}
+	} else {
+		logger.Info("Hard-pin resolver not wired: ROUTER_HARD_PIN_MODEL operator override is set and absolute by design", "model", hardPinModel)
 	}
 
 	// Default-eligible set for proxy.Service: env-keyed providers only.
@@ -534,6 +590,9 @@ func main() {
 	// falls back to handover.TrimLastN on switch turns.
 	plannerEnabled := config.GetOr("ROUTER_PLANNER_ENABLED", "true") == "true"
 	effortEscalation := config.GetOr("ROUTER_EFFORT_ESCALATION", "false") == "true"
+	// Per-turn large-vs-small action-classifier swap. Off by default until the
+	// Layer-2 extrinsic validation clears it; enabling loads the compiled-in head.
+	bandSwapEnabled := config.GetOr("ROUTER_BAND_SWAP", "false") == "true"
 	// Cyclic-loop escalate-to-opus kill switch + log-not-act holdout. Enabled
 	// by default (the lever shipped enabled); flipping the switch off detaches
 	// the escalation ACTION without losing detection telemetry. The holdout
@@ -623,8 +682,30 @@ func main() {
 		logger.Info("RL policy router disabled (ROUTER_RL_SIDECAR_URL unset); x-weave-router-strategy: rl will return 503")
 	}
 
+	// Opt-in Thompson-sampling bandit. Wired only when ROUTER_BANDIT_POSTERIOR_FILE
+	// points at a ts_posterior.json from train_thompson_posterior.py; the
+	// x-weave-router-strategy: bandit header then routes through it. Wraps the
+	// raw cluster scorer (not the explore wrapper). Unset path -> nil -> 503.
+	var banditRouter router.Router
+	if posteriorPath := strings.TrimSpace(config.GetOr("ROUTER_BANDIT_POSTERIOR_FILE", "")); posteriorPath != "" {
+		post, loadErr := bandit.LoadPosterior(posteriorPath)
+		if loadErr != nil {
+			logger.Error(
+				"Bandit posterior load failed; x-weave-router-strategy: bandit will return 503",
+				"path", posteriorPath,
+				"err", loadErr,
+			)
+		} else {
+			banditRouter = bandit.New(rtr, post)
+			logger.Info("Bandit strategy router wired", "posterior_file", posteriorPath)
+		}
+	} else {
+		logger.Info("Bandit strategy router disabled (ROUTER_BANDIT_POSTERIOR_FILE unset); x-weave-router-strategy: bandit will return 503")
+	}
+
 	proxySvc := proxy.NewService(routeEntry, providerMap, emitter, embedOnlyUser, semanticCache, pinStore, hardPinExplore, hardPinProvider, hardPinModel, repo.Telemetry).
 		WithRLRouter(rlRouter).
+		WithBanditRouter(banditRouter).
 		WithContentCapture(captureMode, captureMaxBytes, nil).
 		WithFeedback(repo.Feedback, feedbackSigner, feedbackBaseURL).
 		WithByokOnly(byokOnly).
@@ -633,6 +714,7 @@ func main() {
 		WithHardPinResolver(hardPinResolver).
 		WithPlannerEnabled(plannerEnabled).
 		WithEffortEscalation(effortEscalation).
+		WithBandSwap(bandSwapEnabled).
 		WithLoopEscalationConfig(loopEscalationEnabled, loopEscalationHoldoutPct).
 		WithLoopEscalationStore(repo.Telemetry).
 		WithSpiralShadowConfig(spiralShadowEnabled).

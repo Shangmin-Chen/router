@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -42,6 +43,15 @@ func ObserveUpstreamHeaders(ctx context.Context, h http.Header) {
 	}
 }
 
+// Adding a provider is a THREE-map edit that must stay in lockstep: the
+// Provider* constant here, its APIKeyEnvVars entry (deployment-key wiring), and
+// its ProviderFamilies entry (translation-dispatch family). Omit the family
+// entry and an inbound request routed to the new provider falls through every
+// cross-format dispatch switch to the ErrProviderNotConfigured default → a
+// silent 502 in prod even though the provider looked "enabled" at boot. The
+// boot-time ValidateDispatchable guard and the providers-package table test both
+// exist to make that omission fail loudly rather than in production; keep all
+// three maps covering the same key set.
 const (
 	ProviderAnthropic  = "anthropic"
 	ProviderOpenAI     = "openai"
@@ -51,7 +61,89 @@ const (
 	ProviderDeepInfra  = "deepinfra"
 	ProviderBedrock    = "bedrock"
 	ProviderMakora     = "makora"
+	ProviderTogether   = "together"
 )
+
+// TranslationFamily is the wire-format family a provider speaks, which selects
+// the cross-format translation/dispatch path in the proxy. It is the structural
+// replacement for the provider-name lists that were duplicated across the
+// dispatch switches: dispatch keys off the family, not off an enumerated set of
+// names, so a newly-added OpenAI-compatible provider is routed correctly the
+// moment it gets a ProviderFamilies entry.
+type TranslationFamily int
+
+const (
+	// FamilyUnknown is the zero value: a provider with no ProviderFamilies
+	// entry. It must never reach the request path (ValidateDispatchable panics
+	// the process at boot if a registered provider maps to it).
+	FamilyUnknown TranslationFamily = iota
+	// FamilyAnthropic speaks the Anthropic Messages wire format natively.
+	FamilyAnthropic
+	// FamilyOpenAICompat speaks the OpenAI Chat Completions wire format
+	// (OpenAI itself plus every OpenAI-compatible upstream: OpenRouter,
+	// Fireworks, DeepInfra, Bedrock's OpenAI-compat surface, Makora, Together).
+	FamilyOpenAICompat
+	// FamilyGemini speaks the Google Generative Language (Gemini) wire format.
+	FamilyGemini
+)
+
+// ProviderFamilies maps every Provider* constant to the wire-format family it
+// speaks. It is the single source of truth for cross-format dispatch; keep it
+// covering EVERY Provider* constant (see the const block's three-map note).
+var ProviderFamilies = map[string]TranslationFamily{
+	ProviderAnthropic:  FamilyAnthropic,
+	ProviderOpenAI:     FamilyOpenAICompat,
+	ProviderGoogle:     FamilyGemini,
+	ProviderOpenRouter: FamilyOpenAICompat,
+	ProviderFireworks:  FamilyOpenAICompat,
+	ProviderDeepInfra:  FamilyOpenAICompat,
+	ProviderBedrock:    FamilyOpenAICompat,
+	ProviderMakora:     FamilyOpenAICompat,
+	ProviderTogether:   FamilyOpenAICompat,
+}
+
+// FamilyFor returns the translation family for a provider, or FamilyUnknown
+// when the provider has no ProviderFamilies entry.
+func FamilyFor(provider string) TranslationFamily {
+	return ProviderFamilies[provider]
+}
+
+// IsOpenAICompat reports whether the provider speaks the OpenAI Chat
+// Completions wire format.
+func IsOpenAICompat(provider string) bool {
+	return FamilyFor(provider) == FamilyOpenAICompat
+}
+
+// AllProviders returns every known Provider* constant (every ProviderFamilies
+// key), sorted for deterministic iteration and display order.
+func AllProviders() []string {
+	out := make([]string, 0, len(ProviderFamilies))
+	for p := range ProviderFamilies {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ValidateDispatchable reports an error if any registered provider maps to
+// FamilyUnknown — i.e. is missing from ProviderFamilies and would fall through
+// every cross-format dispatch switch to ErrProviderNotConfigured at request
+// time. The composition root calls this right after the provider map is built
+// and panics on error so the misconfiguration aborts the process at boot rather
+// than surfacing as a silent 502 in production.
+func ValidateDispatchable(registered []string) error {
+	missing := make([]string, 0)
+	for _, p := range registered {
+		if FamilyFor(p) == FamilyUnknown {
+			missing = append(missing, p)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	sort.Strings(missing)
+	return fmt.Errorf("providers missing a ProviderFamilies entry (add them to internal/providers/provider.go): %s", strings.Join(missing, ", "))
+}
 
 // APIKeyEnvVars maps provider name to the env var providing its deployment-level upstream API key.
 // Bedrock uses AWS-issued long-term Bedrock API keys (static bearer tokens), not SigV4 access keys.
@@ -64,6 +156,7 @@ var APIKeyEnvVars = map[string]string{
 	ProviderDeepInfra:  "DEEPINFRA_API_KEY",
 	ProviderBedrock:    "AWS_BEARER_TOKEN_BEDROCK",
 	ProviderMakora:     "MAKORA_API_KEY",
+	ProviderTogether:   "TOGETHER_API_KEY",
 }
 
 // APIKeyEnvVar returns the env-var name for the given provider, or empty
@@ -195,6 +288,20 @@ var ErrUpstreamIdleTimeout = errors.New("upstream sse idle timeout")
 // httputil re-exports it as httputil.ErrUpstreamOutputStall.
 var ErrUpstreamOutputStall = errors.New("upstream sse output stall")
 
+// ErrUpstreamSlowThroughput is the sentinel cause set when a provider adapter's
+// minimum-throughput watchdog fires: the upstream IS producing output (so
+// neither ErrUpstreamIdleTimeout nor ErrUpstreamOutputStall trips — the mark is
+// fed steadily), but at a sustained rate so low that the turn would dribble for
+// minutes and trip none of the other watchdogs while the client (Claude Code)
+// appears frozen. This is the 2026-06-25 failure mode: a deepseek/deepseek-v4-flash
+// stream emitted ~1774 output deltas over ~132s (~13 events/s) — a clean,
+// steadily-flowing 200 that no existing guard classified as retryable, riding
+// toward the 600s request cap. Like the other stall sentinels it is
+// upstream-owned and retryable. Defined here (not in httputil) so IsRetryable
+// can classify it without the import cycle; httputil re-exports it as
+// httputil.ErrUpstreamSlowThroughput.
+var ErrUpstreamSlowThroughput = errors.New("upstream sse slow throughput")
+
 // IsRetryableStatus reports whether an upstream HTTP status is worth
 // retrying on a different provider. Covers transient upstream-side faults
 // (5xx + 408 timeout + 429 rate-limit). 4xx ≠ 408/429 are the client's
@@ -235,6 +342,14 @@ func IsRetryable(err error) bool {
 	// the caller-cancellation guard for the same reason as ErrUpstreamIdleTimeout
 	// — the watchdog surfaces it via the request context's cancel cause.
 	if errors.Is(err, ErrUpstreamOutputStall) {
+		return true
+	}
+	// A sustained sub-throughput stall is upstream-owned: the stream produced
+	// output the whole time, just far too slowly to be usable. Classified
+	// before the caller-cancellation guard for the same reason as the other
+	// stall sentinels — the watchdog surfaces it via the request context's
+	// cancel cause, which may also chain context.Canceled.
+	if errors.Is(err, ErrUpstreamSlowThroughput) {
 		return true
 	}
 	// Client-side cancellation and per-request deadlines are owned by the

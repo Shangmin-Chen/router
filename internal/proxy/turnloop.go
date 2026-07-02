@@ -183,9 +183,14 @@ func (s *Service) runTurnLoop(
 		// computed over every registered provider, but the request may
 		// only have BYOK credentials for a subset. Resolve per-request
 		// against the request's enabled-providers set so compaction
-		// stays on a provider the request can authenticate to.
+		// stays on a provider the request can authenticate to. The
+		// resolver also applies the installation's excluded_models
+		// (req.ExcludedModels) as a deny set — the hard-pin path bypasses
+		// the scorer, which is otherwise the only place exclusions are
+		// honored, so without this an excluded model would still serve
+		// all title-gen/classifier/probe traffic.
 		if s.hardPinResolver != nil {
-			p, m, ok := s.hardPinResolver(req.EnabledProviders)
+			p, m, ok := s.hardPinResolver(req.EnabledProviders, req.ExcludedModels)
 			if !ok {
 				log.Warn(
 					"Hard-pin: no eligible provider for request; returning ErrClusterUnavailable",
@@ -195,6 +200,17 @@ func (s *Service) runTurnLoop(
 				return res, fmt.Errorf("hard-pin: no eligible provider for %s: %w", res.TurnType, cluster.ErrClusterUnavailable)
 			}
 			provider, model = p, m
+		} else if _, excluded := req.ExcludedModels[model]; excluded {
+			// No resolver wired (bundle load failed at boot) but the
+			// static boot-time pin is on the installation's exclude
+			// list. We have no cluster bundle here to pick an allowed
+			// alternative, so preserve current behavior and serve the
+			// pin, but log so the misroute is visible in telemetry.
+			log.Warn(
+				"Hard-pin: boot-time pin is in excluded_models but no resolver is wired to pick an alternative; serving pin anyway",
+				"turn_type", string(res.TurnType),
+				"model", model,
+			)
 		}
 		// Operator hard-pins bypass the tier ceiling by design — the
 		// ROUTER_HARD_PIN_MODEL env var is an explicit operator opt-in
@@ -321,9 +337,21 @@ func (s *Service) runTurnLoop(
 	// this turn and treat the pin as missing so downstream sticky branches
 	// (ToolResult, !plannerEnabled) cannot re-anchor it before the scorer runs.
 	if pinFound && pin.LastOutputTokens >= prevTurnMaxedOutThreshold {
+		// Exclude the model that actually generated LastOutputTokens. With band
+		// swap the served model can be the paired member while the pin row keeps
+		// the anchor in Model, so keying off pin.Model would exclude the wrong
+		// (healthy) model and leave the broken one eligible — reopening the very
+		// auto-continue loop this guard breaks. LastServedModel comes from usage
+		// writeback and names the model that hit the cap; fall back to pin.Model
+		// for older rows written before the field existed.
+		maxedModel := pin.LastServedModel
+		if maxedModel == "" {
+			maxedModel = pin.Model
+		}
 		log.Info("Session pin maxed out on previous turn; excluding for this turn",
 			"pin_model", pin.Model,
 			"pin_provider", pin.Provider,
+			"maxed_model", maxedModel,
 			"last_output_tokens", pin.LastOutputTokens,
 		)
 		// Defensive copy: callers may share the ExcludedModels map across requests.
@@ -331,7 +359,7 @@ func (s *Service) runTurnLoop(
 		for k := range req.ExcludedModels {
 			excluded[k] = struct{}{}
 		}
-		excluded[pin.Model] = struct{}{}
+		excluded[maxedModel] = struct{}{}
 		req.ExcludedModels = excluded
 		pinFound = false
 		pin = sessionpin.Pin{}
@@ -602,11 +630,16 @@ func (s *Service) runTurnLoop(
 	res.PlannerDecision = decision
 
 	if decision.Outcome == planner.OutcomeStay && pinFound {
-		stay := pinDecision(pin)
-		res.Decision = stay
+		anchor := pinDecision(pin)
+		// Per-turn band swap: on a sticky MainLoop the predicted next action
+		// chooses which half of the pinned pair actually serves this turn. The
+		// PIN stays anchored (pinned_model/paired unchanged via the anchor
+		// refresh below) so we can swap again next turn; only res.Decision moves.
+		served := s.bandSwapServed(ctx, res.TurnType, pin, fresh, req.HasImages, req.EnabledProviders, req.ExcludedModels)
+		res.Decision = served
 		res.StickyHit = true
 		res.PinTier = "postgres_stay_" + decision.Reason
-		s.refreshPin(ctx, installationID, res.SessionKey, pin, res.PinRole, stay)
+		s.refreshPin(ctx, installationID, res.SessionKey, pin, res.PinRole, anchor)
 		return res, nil
 	}
 
